@@ -1,0 +1,222 @@
+import sys
+import os
+from pathlib import Path
+import cv2
+import numpy as np
+import time
+import threading
+import argparse
+from ultralytics import YOLO
+
+# Resolve paths
+BASE_DIR = Path(__file__).resolve().parent
+MODELS_DIR = BASE_DIR / "models"
+TESTING_DIR = BASE_DIR / "datafortesting-and-trainning" / "testing"
+
+# Built-in lightweight tracker so no external 'sort' / 'filterpy' dependency is required
+class SimpleSortTracker:
+    def __init__(self, max_age=5, min_hits=3, iou_threshold=0.3):
+        self.max_age = max_age
+        self.min_hits = min_hits
+        self.iou_threshold = iou_threshold
+        self.next_id = 1
+        self.tracks = {}  # id: {'bbox': [x1, y1, x2, y2], 'hits': int, 'age': int}
+
+    @staticmethod
+    def _iou(b1, b2):
+        xA = max(b1[0], b2[0])
+        yA = max(b1[1], b2[1])
+        xB = min(b1[2], b2[2])
+        yB = min(b1[3], b2[3])
+        inter = max(0, xB - xA) * max(0, yB - yA)
+        areaA = max(0, b1[2] - b1[0]) * max(0, b1[3] - b1[1])
+        areaB = max(0, b2[2] - b2[0]) * max(0, b2[3] - b2[1])
+        union = areaA + areaB - inter
+        return inter / union if union > 0 else 0
+
+    def update(self, detections):
+        updated_tracks = []
+        if len(detections) == 0:
+            for tid in list(self.tracks.keys()):
+                self.tracks[tid]['age'] += 1
+                if self.tracks[tid]['age'] > self.max_age:
+                    del self.tracks[tid]
+            return np.empty((0, 5))
+
+        matched = set()
+        det_matched = set()
+
+        for tid, track in self.tracks.items():
+            best_iou = 0.0
+            best_det_idx = -1
+            for d_idx, det in enumerate(detections):
+                if d_idx in det_matched:
+                    continue
+                iou = self._iou(track['bbox'], det[:4])
+                if iou > best_iou:
+                    best_iou = iou
+                    best_det_idx = d_idx
+
+            if best_iou >= self.iou_threshold and best_det_idx >= 0:
+                self.tracks[tid]['bbox'] = detections[best_det_idx][:4]
+                self.tracks[tid]['hits'] += 1
+                self.tracks[tid]['age'] = 0
+                matched.add(tid)
+                det_matched.add(best_det_idx)
+
+        for tid in list(self.tracks.keys()):
+            if tid not in matched:
+                self.tracks[tid]['age'] += 1
+                if self.tracks[tid]['age'] > self.max_age:
+                    del self.tracks[tid]
+
+        for d_idx, det in enumerate(detections):
+            if d_idx not in det_matched:
+                self.tracks[self.next_id] = {
+                    'bbox': det[:4],
+                    'hits': 1,
+                    'age': 0
+                }
+                self.next_id += 1
+
+        for tid, track in self.tracks.items():
+            if track['hits'] >= self.min_hits or track['age'] == 0:
+                b = track['bbox']
+                updated_tracks.append([b[0], b[1], b[2], b[3], tid])
+
+        return np.array(updated_tracks) if updated_tracks else np.empty((0, 5))
+
+try:
+    sys.path.append(os.path.join(os.getcwd(), "sort"))
+    from sort import Sort
+except Exception:
+    Sort = SimpleSortTracker
+
+# === Settings & CLI ===
+parser = argparse.ArgumentParser(description="Multi-Lane Traffic Signal & Speed Tracking")
+default_model = str(MODELS_DIR / "yolo11n.pt" if (MODELS_DIR / "yolo11n.pt").exists() else "yolov8n.pt")
+parser.add_argument("--model", type=str, default=default_model, help="YOLO model path")
+args, _ = parser.parse_known_args()
+
+# Collect available local videos for 4 lanes
+local_videos = [
+    TESTING_DIR / "vid1.mp4",
+    TESTING_DIR / "traffic_detection.mp4",
+    TESTING_DIR / "british_highway_traffic.mp4",
+    TESTING_DIR / "trafficCrowdVideo.mp4"
+]
+video_paths = [str(v) if v.exists() else str(TESTING_DIR / "vid1.mp4") for v in local_videos]
+
+DISPLAY_WIDTH, DISPLAY_HEIGHT = 640, 360
+VEHICLE_CLASSES = [2, 3, 5, 7]  # Car, motorcycle, bus, truck in COCO
+PPM = 8
+FRAME_RATE = 30
+
+print(f"📦 Loading Vehicle Model: {args.model}")
+vehicle_model = YOLO(args.model)
+tracker = Sort(max_age=5, min_hits=3, iou_threshold=0.3)
+caps = [cv2.VideoCapture(path) for path in video_paths]
+last_frames = [None] * 4
+traffic_signals = [1, 0, 0, 0]
+lock = threading.Lock()
+previous_positions = {}
+
+def create_signal_image(lane_idx, frame, signal_state):
+    color_map = {0: (0, 255, 255), 1: (0, 255, 0), 2: (0, 255, 255)}
+    label_map = {0: "RED", 1: "GREEN", 2: "YELLOW"}
+    if frame is None:
+        frame = np.zeros((DISPLAY_HEIGHT, DISPLAY_WIDTH, 3), dtype=np.uint8)
+    resized = cv2.resize(frame, (DISPLAY_WIDTH, DISPLAY_HEIGHT))
+    label = f"Lane {lane_idx + 1} - {label_map[signal_state]}"
+    cv2.putText(resized, label, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, color_map[signal_state], 3)
+    return resized
+
+def traffic_control():
+    global traffic_signals
+    while True:
+        for lane in range(4):
+            with lock:
+                traffic_signals = [0] * 4
+                traffic_signals[lane] = 1
+            time.sleep(7)
+            with lock:
+                traffic_signals[lane] = 2
+            time.sleep(2)
+            with lock:
+                traffic_signals[lane] = 0
+
+def estimate_speed(prev, curr, ppm, fps):
+    dx = curr[0] - prev[0]
+    dy = curr[1] - prev[1]
+    pixel_dist = np.sqrt(dx ** 2 + dy ** 2)
+    meters = pixel_dist / ppm
+    speed_mps = meters * fps
+    return speed_mps * 3.6
+
+def process_lanes():
+    global last_frames
+    while True:
+        display_frames = []
+
+        for i, cap in enumerate(caps):
+            with lock:
+                signal = traffic_signals[i]
+
+            if signal == 1:  # GREEN
+                ret, frame = cap.read()
+                if not ret:
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    ret, frame = cap.read()
+                if not ret:
+                    frame = np.zeros((DISPLAY_HEIGHT, DISPLAY_WIDTH, 3), dtype=np.uint8)
+
+                last_frames[i] = frame.copy()
+
+                results = vehicle_model(frame, verbose=False)
+                detections = []
+
+                for result in results:
+                    for box, conf, cls in zip(result.boxes.xyxy, result.boxes.conf, result.boxes.cls):
+                        if int(cls) in VEHICLE_CLASSES and conf > 0.4:
+                            x1, y1, x2, y2 = box
+                            detections.append([x1.item(), y1.item(), x2.item(), y2.item(), conf.item()])
+
+                detections = np.array(detections) if detections else np.empty((0, 5))
+                tracked_objects = tracker.update(detections)
+                speeds = {}
+
+                for obj in tracked_objects:
+                    x1, y1, x2, y2, track_id = obj
+                    cx, cy = int((x1 + x2) / 2), int((y1 + y2) / 2)
+                    centroid = (cx, cy)
+
+                    if track_id in previous_positions:
+                        speeds[track_id] = estimate_speed(previous_positions[track_id], centroid, PPM, FRAME_RATE)
+                    previous_positions[track_id] = centroid
+
+                    cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (255, 0, 0), 2)
+                    label = f"ID {int(track_id)} | {speeds.get(track_id, 0):.1f} km/h"
+                    cv2.putText(frame, label, (int(x1), int(y1) - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+
+                display_frames.append(create_signal_image(i, frame, signal))
+
+            else:
+                frame = last_frames[i]
+                display_frames.append(create_signal_image(i, frame, signal))
+
+        top = np.hstack((display_frames[0], display_frames[1]))
+        bottom = np.hstack((display_frames[2], display_frames[3]))
+        grid = np.vstack((top, bottom))
+
+        cv2.imshow("Traffic Monitoring System", grid)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    for cap in caps:
+        cap.release()
+    cv2.destroyAllWindows()
+
+# === Start ===
+controller_thread = threading.Thread(target=traffic_control, daemon=True)
+controller_thread.start()
+process_lanes()

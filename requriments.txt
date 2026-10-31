@@ -1,0 +1,15 @@
+# Core deep learning & vision dependencies
+opencv-python
+torch
+torchvision
+numpy
+qrcode
+requests
+paddleocr
+ultralytics
+
+# Web Dashboard & API dependencies
+fastapi
+uvicorn
+python-multipart
+jinja2
